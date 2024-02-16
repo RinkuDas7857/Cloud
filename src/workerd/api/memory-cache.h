@@ -11,6 +11,26 @@
 
 namespace workerd::api {
 
+// The MemoryCache mechanism is an in-process, memory-resident data cache that
+// can be configured for workers. A single cache instance can be unique to an
+// individual worker or shared across multiple workers / isolates.
+//
+// Instances are configured as bindings on the worker (set up in the workers
+// configuration) and accessible via the environment bindings passed into the
+// worker handler functions:
+//
+//  async fetch(req, env) {
+//    await env.MY_CACHE.read('key', () => {
+//      // Called if the 'key' does not exist in the cache
+//      return 'new value';
+//    });
+//  }
+//
+// The cache is only capable of storing values that are v8 serializable (so
+// JS primitives other than Symbol, ordinary JavaScript objects but not class
+// instances, etc). Objects that represent i/o (like streams or promises are
+// explicitly not supported.
+
 struct CacheValue: kj::AtomicRefcounted {
   CacheValue(kj::Array<kj::byte>&& bytes): bytes(kj::mv(bytes)) {}
 
@@ -55,14 +75,21 @@ struct CacheValueProduceResult {
   JSG_STRUCT(value, expiration);
 };
 
+class MemoryCacheProvider;
+
 // An in-memory cache that can be accessed by any number of workers/isolates
 // within the same process.
-class SharedMemoryCache {
+// TODO(soon): We plan to explore replacing this implementation with a memcached-based
+// implementation in the near future. The memcached-based impl would likely be
+// fairly different from this implementation so quite a few of the details here
+// are expected to change.
+class SharedMemoryCache : public kj::AtomicRefcounted {
 private:
   struct InProgress;
-  struct ThreadUnsafeData;
 
 public:
+  struct ThreadUnsafeData;
+
   struct Limits {
     // The maximum number of keys that may exist within the cache at the same
     // time. The cache size grows at least linearly in the number of entries.
@@ -116,16 +143,16 @@ public:
 
   using AdditionalResizeMemoryLimitHandler = kj::Function<void(ThreadUnsafeData&)>;
 
-  SharedMemoryCache(const kj::StringPtr& uuid,
-      kj::Maybe<AdditionalResizeMemoryLimitHandler&> additionalResizeMemoryLimitHandler)
-      : data(),
-        additionalResizeMemoryLimitHandler(additionalResizeMemoryLimitHandler),
-        uuid_(kj::str(uuid)),
-        instanceId_(randomUUID(kj::none)) {}
+  SharedMemoryCache(
+      kj::Maybe<const MemoryCacheProvider&> provider,
+      kj::StringPtr id,
+      kj::Maybe<AdditionalResizeMemoryLimitHandler&> additionalResizeMemoryLimitHandler);
 
-  inline kj::StringPtr uuid() { return uuid_; }
+  ~SharedMemoryCache() noexcept(false);
 
-  inline kj::StringPtr instanceId() { return instanceId_; }
+  kj::StringPtr getId() const { return id; }
+
+  kj::Own<SharedMemoryCache> addRef();
 
 public:
   // RAII class that attaches itself to a cache, suggests cache limits to the
@@ -134,11 +161,9 @@ public:
   public:
     KJ_DISALLOW_COPY(Use);
 
-    Use(SharedMemoryCache& cache, const Limits& limits): cache(cache), limits(limits) {
-      cache.suggest(limits);
-    }
-    Use(Use&& other): cache(other.cache), limits(other.limits) { cache.suggest(limits); }
-    ~Use() noexcept(false) { cache.unsuggest(limits); }
+    Use(kj::Own<SharedMemoryCache> cache, const Limits& limits);
+    Use(Use&& other);
+    ~Use() noexcept(false);
 
     // Returns a cached value for the given key if one exists (and has not
     // expired). If no such value exists, nothing is returned, regardless of any
@@ -176,7 +201,7 @@ public:
     // erased.
     void handleFallbackFailure(InProgress& inProgress);
 
-    SharedMemoryCache& cache;
+    kj::Own<SharedMemoryCache> cache;
     Limits limits;
   };
 
@@ -348,6 +373,7 @@ private:
     }
   };
 
+public:
   struct ThreadUnsafeData {
     KJ_DISALLOW_COPY_AND_MOVE(ThreadUnsafeData);
 
@@ -393,17 +419,27 @@ private:
     kj::Table<kj::Own<InProgress>, kj::HashIndex<InProgress::KeyCallbacks>> inProgress;
   };
 
+private:
+
   // To ensure thread-safety, all mutable data is guarded by a mutex. Each cache
   // operation requires an exclusive lock. Even read-only operations need to
   // update the liveliness of cache entries, which currently requires a lock.
   kj::MutexGuarded<ThreadUnsafeData> data;
+
+  // The MemoryCacheProvider instance needs to be guaranteed to outlive the SharedMemoryCache
+  // instance. When the SharedMemoryCache is destroyed, it will remove itself from the provider.
+  // TODO(cleanup): Eventually, assuming/once the kj::Ptr<T> work progresses, it would be safer
+  // to replace this with a kj::Ptr<MemoryCacheProvider>
+  kj::Maybe<const MemoryCacheProvider&> provider;
+
+  // The MemoryCacheProvider owns the underlying kj::String for the id, since the provider has
+  // to outlive this SharedMemoryCache instance, so does the id. When this SharedMemoryCache
+  // is destroyed and unregisters itself, the id will also be freed.
+  kj::StringPtr id;
+
+  // Same as above, the MemoryCacheProvider owns the actual handler here. Since that is guaranteed
+  // to outlive this SharedMemoryCache instance, so is the handler.
   kj::Maybe<AdditionalResizeMemoryLimitHandler&> additionalResizeMemoryLimitHandler;
-
-  // A unique identifier associated with this cache.
-  const kj::String uuid_;
-
-  // Uniquely identifies this instance of this cache.
-  const kj::String instanceId_;
 };
 
 // JavaScript class that allows accessing an in-memory cache.
@@ -432,13 +468,24 @@ private:
 // It is responsible for owning the SharedMemoryCache instances and providing them to the
 // bindings as needed. The default implementation (created and returned by createDefault())
 // uses a simple in-memory map to store the SharedMemoryCache instances.
+//
+// This class is virtualized for a number of reasons, the most important of which is that
+// we may want to replace the default implementation in production with one that includes
+// more metrics and monitoring, or that uses a different cache implementation. Ultimately,
+// however, if we do end up having additional implementations, it will be the SharedMemoryCache
+// class that will need to be updated.
 class MemoryCacheProvider {
 public:
   virtual ~MemoryCacheProvider() noexcept(false) = default;
-  virtual SharedMemoryCache& getInstance(kj::StringPtr cacheId, uint32_t ownerId) const = 0;
+
+  virtual kj::Own<SharedMemoryCache> getInstance(
+      kj::Maybe<kj::StringPtr> cacheId = kj::none) const = 0;
+
+  virtual void removeInstance(SharedMemoryCache& instance) const = 0;
 
   static kj::Own<MemoryCacheProvider> createDefault(
-    kj::Maybe<SharedMemoryCache::AdditionalResizeMemoryLimitHandler> additionalResizeMemoryLimitHandler = kj::none);
+      kj::Maybe<SharedMemoryCache::AdditionalResizeMemoryLimitHandler>
+           additionalResizeMemoryLimitHandler = kj::none);
 };
 
 // clang-format off

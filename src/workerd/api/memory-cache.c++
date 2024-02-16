@@ -4,6 +4,7 @@
 #include <workerd/jsg/ser.h>
 #include <workerd/io/io-context.h>
 #include <workerd/api/util.h>
+#include <workerd/util/weak-refs.h>
 
 namespace workerd::api {
 
@@ -32,6 +33,21 @@ static bool hasExpired(const kj::Maybe<double>& expiration, bool allowOutsideIoC
     return e < now;
   }
   return false;
+}
+
+SharedMemoryCache::SharedMemoryCache(
+    kj::Maybe<const MemoryCacheProvider&> provider,
+    kj::StringPtr id,
+    kj::Maybe<AdditionalResizeMemoryLimitHandler&> additionalResizeMemoryLimitHandler)
+    : data(),
+      provider(provider),
+      id(id),
+      additionalResizeMemoryLimitHandler(additionalResizeMemoryLimitHandler) {}
+
+SharedMemoryCache::~SharedMemoryCache() noexcept(false) {
+  KJ_IF_SOME(p, provider) {
+    p.removeInstance(*this);
+  }
 }
 
 void SharedMemoryCache::suggest(const Limits& limits) {
@@ -198,15 +214,34 @@ void SharedMemoryCache::removeIfExistsWhileLocked(ThreadUnsafeData& data, const 
   }
 }
 
+kj::Own<SharedMemoryCache> SharedMemoryCache::addRef() {
+  return kj::atomicAddRef(*this);
+}
+
+SharedMemoryCache::Use::Use(kj::Own<SharedMemoryCache> cache, const Limits& limits)
+    : cache(kj::mv(cache)), limits(limits) {
+  this->cache->suggest(limits);
+}
+
+SharedMemoryCache::Use::Use(Use&& other): cache(kj::mv(other.cache)), limits(other.limits) {
+  this->cache->suggest(limits);
+}
+
+SharedMemoryCache::Use::~Use() noexcept(false) {
+  if (cache.get() != nullptr) {
+    cache->unsuggest(limits);
+  }
+}
+
 kj::Maybe<kj::Own<CacheValue>> SharedMemoryCache::Use::getWithoutFallback(const kj::String& key) {
-  auto data = cache.data.lockExclusive();
-  return cache.getWhileLocked(*data, key);
+  auto data = cache->data.lockExclusive();
+  return cache->getWhileLocked(*data, key);
 }
 
 kj::OneOf<kj::Own<CacheValue>, kj::Promise<SharedMemoryCache::Use::GetWithFallbackOutcome>>
 SharedMemoryCache::Use::getWithFallback(const kj::String& key) {
-  auto data = cache.data.lockExclusive();
-  KJ_IF_SOME(existingValue, cache.getWhileLocked(*data, key)) {
+  auto data = cache->data.lockExclusive();
+  KJ_IF_SOME(existingValue, cache->getWhileLocked(*data, key)) {
     return kj::mv(existingValue);
   } else KJ_IF_SOME(existingInProgress, data->inProgress.find(key)) {
     // We return a Promise, but we keep the fulfiller. We might fulfill it
@@ -250,8 +285,8 @@ SharedMemoryCache::Use::FallbackDoneCallback SharedMemoryCache::Use::prepareFall
       // The fallback succeeded. Store the value in the cache and propagate it to
       // all waiting requests, even if it has expired already.
       status.hasSettled = true;
-      auto data = cache.data.lockExclusive();
-      cache.putWhileLocked(
+      auto data = cache->data.lockExclusive();
+      cache->putWhileLocked(
           *data, kj::str(inProgress.key), kj::atomicAddRef(*result.value), result.expiration);
       for (auto& waiter: inProgress.waiting) {
         waiter.fulfiller->fulfill(kj::atomicAddRef(*result.value));
@@ -273,7 +308,7 @@ void SharedMemoryCache::Use::handleFallbackFailure(InProgress& inProgress) {
   // If there is another queued fallback, retrieve it and remove it from the
   // queue. Otherwise, just delete the queue entirely.
   {
-    auto data = cache.data.lockExclusive();
+    auto data = cache->data.lockExclusive();
     auto next = inProgress.waiting.begin();
     if (next != inProgress.waiting.end()) {
       nextFulfiller = kj::mv(next->fulfiller);
@@ -392,7 +427,7 @@ jsg::Promise<jsg::JsRef<jsg::JsValue>> MemoryCache::read(jsg::Lock& js,
 namespace {
 // Data structure that maps unique cache identifiers to cache instances.
 // This allows separate isolates to access the same in-memory caches.
-class MemoryCacheMap: public MemoryCacheProvider {
+class MemoryCacheMap final: public MemoryCacheProvider {
 public:
   MemoryCacheMap(
       kj::Maybe<SharedMemoryCache::AdditionalResizeMemoryLimitHandler>
@@ -400,37 +435,66 @@ public:
       : additionalResizeMemoryLimitHandler(kj::mv(additionalResizeMemoryLimitHandler)) {}
   KJ_DISALLOW_COPY_AND_MOVE(MemoryCacheMap);
 
+  ~MemoryCacheMap() noexcept(false) {
+    // TODO(cleanup): Later, assuming progress is made on kj::Ptr<T>, we ought to be able
+    // to remove this. For now we just need to make sure that the MemoryCacheMap instance
+    // outlives any SharedMemoryCache instances that are referencing it.
+    KJ_REQUIRE(caches.lockShared()->size() == 0,
+        "There are still active SharedMemoryCache instances. Use-after-free errors are likely.");
+  }
+
   // Gets an existing SharedMemoryCache instance or creates a new one if no
   // cache with the given id exists.
-  SharedMemoryCache& getInstance(kj::StringPtr cacheId, uint32_t ownerId) const override;
+  kj::Own<SharedMemoryCache> getInstance(
+      kj::Maybe<kj::StringPtr> cacheId = kj::none) const override;
+
+  void removeInstance(SharedMemoryCache& instance) const override;
 
 private:
-  using HashMap = kj::HashMap<kj::String, kj::Own<SharedMemoryCache>>;
-
   kj::Maybe<SharedMemoryCache::AdditionalResizeMemoryLimitHandler>
       additionalResizeMemoryLimitHandler;
 
   // All existing in-memory caches.
-  kj::MutexGuarded<HashMap> caches;
-  // TODO(later): consider using a kj::Table with a HashIndex that uses
-  // SharedMemoryCache::uuid() instead.
+  // TODO(cleanup): Later, assuming progress is made on kj::Ptr<T>, it would be nice
+  // to avoid the use of the bare pointer to SharedMemoryCache* here. When the SharedMemoryCache
+  // is destroyed, it will remove itself from this cache by calling removeInstance.
+  kj::MutexGuarded<kj::HashMap<kj::String, SharedMemoryCache*>> caches;
 };
 
-SharedMemoryCache& MemoryCacheMap::getInstance(
-    kj::StringPtr cacheId, uint32_t ownerId) const {
-  auto lock = caches.lockExclusive();
-  auto id = kj::str(cacheId, "::", ownerId);
-  return *lock->findOrCreate(id, [this, &id]() {
+kj::Own<SharedMemoryCache> MemoryCacheMap::getInstance(
+    kj::Maybe<kj::StringPtr> cacheId) const {
+
+  const auto makeCache = [this](kj::Maybe<const MemoryCacheProvider&> provider, kj::StringPtr id) {
+    // The cache doesn't exist in the map. Let's create it.
     auto handler = additionalResizeMemoryLimitHandler.map([](
-            const SharedMemoryCache::AdditionalResizeMemoryLimitHandler& handler)
-                -> SharedMemoryCache::AdditionalResizeMemoryLimitHandler& {
+        const SharedMemoryCache::AdditionalResizeMemoryLimitHandler& handler)
+            -> SharedMemoryCache::AdditionalResizeMemoryLimitHandler& {
       return const_cast<SharedMemoryCache::AdditionalResizeMemoryLimitHandler&>(handler);
     });
-    return HashMap::Entry{
-      kj::str(id),
-      kj::heap<SharedMemoryCache>(id, handler)
-    };
-  });
+    return kj::atomicRefcounted<SharedMemoryCache>(provider, id, handler);
+  };
+
+  KJ_IF_SOME(cid, cacheId) {
+    auto lock = caches.lockExclusive();
+
+    // First, let's see if the cache already exists. If it does, we'll just return
+    // a strong reference to it.
+    KJ_IF_SOME(weak, lock->find(cid)) {
+      return weak->addRef();
+    }
+
+    // The cache doesn't exist, let's create it and add it to the map
+    auto cache = makeCache(kj::Maybe<const MemoryCacheProvider&>(*this), cid);
+    lock->insert(kj::str(cid), cache.get());
+    return kj::mv(cache);
+  }
+
+  // Since we don't have a cache id, we'll just create a new cache and return it.
+  return makeCache(kj::none, nullptr);
+}
+
+void MemoryCacheMap::removeInstance(SharedMemoryCache& instance) const {
+  KJ_ASSERT(caches.lockExclusive()->erase(instance.getId()));
 }
 }  // namespace
 

@@ -13,10 +13,16 @@ common --noenable_bzlmod
 # When that issue and https://github.com/bazelbuild/bazel/issues/20576 have been addressed, we can
 # also explore --remote_download_minimal.
 
-#TODO
-build --remote_download_minimal
-build --remote_download_regex=src/workerd/server/workerd
-build --jobs=18
+#TODO: Seeing build problems appear on macOS
+build:linux --remote_download_minimal
+build:windows --remote_download_minimal
+# TODO: Enable for release CI job
+#build:linux --remote_download_regex=src/workerd/server/workerd
+#build:windows --remote_download_regex=src/workerd/server/workerd
+build:macos --remote_download_all
+# Provide more build jobs than there are cores so that we can run cache fetching actions and build
+# locally at a higher rate – using the cache generally uses little CPU.
+build --jobs=24
 build --noincompatible_disallow_unsound_directory_outputs
 
 # Enable webgpu

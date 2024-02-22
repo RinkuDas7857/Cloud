@@ -12,7 +12,12 @@ common --noenable_bzlmod
 # time. Use --remote_download_all to disable BwoB for now.
 # When that issue and https://github.com/bazelbuild/bazel/issues/20576 have been addressed, we can
 # also explore --remote_download_minimal.
-build --remote_download_all
+
+#TODO
+build --remote_download_minimal
+build --remote_download_regex=src/workerd/server/workerd
+build --jobs=18
+build --noincompatible_disallow_unsound_directory_outputs
 
 # Enable webgpu
 build --//src/workerd/io:enable_experimental_webgpu=True

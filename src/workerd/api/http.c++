@@ -1880,7 +1880,8 @@ kj::Maybe<jsg::Ref<JsRpcProperty>> Fetcher::getRpcMethod(jsg::Lock& js, kj::Stri
   return jsg::alloc<JsRpcProperty>(JSG_THIS, kj::mv(name));
 }
 
-rpc::JsRpcTarget::Client Fetcher::getClientForOneCall(jsg::Lock& js) {
+rpc::JsRpcTarget::Client Fetcher::getClientForOneCall(
+    jsg::Lock& js, kj::Vector<kj::StringPtr>& path) {
   auto& ioContext = IoContext::current();
   auto worker = getClient(ioContext, kj::none, "jsRpcSession"_kjc);
   auto event = kj::heap<api::JsRpcSessionCustomEventImpl>(
@@ -1895,6 +1896,8 @@ rpc::JsRpcTarget::Client Fetcher::getClientForOneCall(jsg::Lock& js) {
   // caught elsewhere.
   ioContext.addTask(worker->customEvent(kj::mv(event)).attach(kj::mv(worker))
       .then([](auto&&) {}, [](kj::Exception&&) {}));
+
+  // (Don't extend `path` because we're the root.)
 
   return result;
 }

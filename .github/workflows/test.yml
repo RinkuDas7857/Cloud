@@ -47,12 +47,12 @@ jobs:
       - uses: actions/checkout@v4
         with:
           show-progress: false
-      - name: Cache
-        id: cache
-        uses: actions/cache@v4
-        with:
-          path: ~/bazel-disk-cache
-          key: bazel-disk-cache-${{ matrix.os.name }}-${{ runner.arch }}${{ matrix.config.suffix }}-${{ hashFiles('.bazelversion', '.bazelrc', 'WORKSPACE') }}
+      # - name: Cache
+        # id: cache
+        # uses: actions/cache@v4
+        # with:
+          # path: ~/bazel-disk-cache
+          # key: bazel-disk-cache-${{ matrix.os.name }}-${{ runner.arch }}${{ matrix.config.suffix }}-${{ hashFiles('.bazelversion', '.bazelrc', 'WORKSPACE') }}
           # Intentionally not reusing an older cache entry using a key prefix, bazel frequently
           # ends up with a larger cache at the end when starting with an available cache entry,
           # resulting in a snowballing cache size and cache download/upload times.
@@ -127,10 +127,10 @@ jobs:
         # timestamps are no longer being added here, the GitHub logs include timestamps (Use
         # 'Show timestamps' on the web interface)
         run: |
-          bazelisk build ${{ matrix.config.bazel-args }} --disk_cache=~/bazel-disk-cache --remote_cache=https://bazel:${{ secrets.BAZEL_CACHE_KEY }}@bazel-remote-cache.devprod.cloudflare.dev --verbose_failures //...
+          bazelisk build ${{ matrix.config.bazel-args }} --remote_cache=https://bazel:${{ secrets.BAZEL_CACHE_KEY }}@bazel-remote-cache.devprod.cloudflare.dev --verbose_failures //...
       - name: Bazel test
         run: |
-          bazelisk test ${{ matrix.config.bazel-args }} --disk_cache=~/bazel-disk-cache --remote_cache=https://bazel:${{ secrets.BAZEL_CACHE_KEY }}@bazel-remote-cache.devprod.cloudflare.dev --keep_going --verbose_failures --test_output=errors //...
+          bazelisk test ${{ matrix.config.bazel-args }} --remote_cache=https://bazel:${{ secrets.BAZEL_CACHE_KEY }}@bazel-remote-cache.devprod.cloudflare.dev --keep_going --verbose_failures --test_output=errors //...
       - name: Report disk usage
         if: always()
         shell: bash
@@ -138,7 +138,7 @@ jobs:
           BAZEL_OUTPUT_BASE=$(bazel info --ui_event_filters=-WARNING output_base)
           BAZEL_REPOSITORY_CACHE=$(bazel info --ui_event_filters=-WARNING repository_cache)
           echo "Bazel cache usage statistics"
-          du -hs -t 1 ~/bazel-disk-cache/* $BAZEL_REPOSITORY_CACHE
+          du -hs -t 1 $BAZEL_REPOSITORY_CACHE
           echo "Bazel output usage statistics"
           du -hs -t 1 $BAZEL_OUTPUT_BASE
           echo "Workspace usage statistics"

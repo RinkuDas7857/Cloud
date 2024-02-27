@@ -726,9 +726,10 @@ private:
 
   // Implementation detail of makeCachePutStream().
 
+  constexpr static size_t MB = 1 << 20;
   constexpr static size_t GB = 1 << 30;
-  constexpr static size_t MAX_TOTAL_PUT_SIZE = 5 * GB;
-  kj::Promise<size_t> cachePutQuota = MAX_TOTAL_PUT_SIZE;
+  size_t MAX_TOTAL_PUT_SIZE;
+  kj::Promise<size_t> cachePutQuota;
 
   kj::TaskSet waitUntilTasks;
   EventOutcome waitUntilStatusValue = EventOutcome::OK;

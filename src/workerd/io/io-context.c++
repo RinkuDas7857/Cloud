@@ -122,6 +122,8 @@ IoContext::IoContext(ThreadContext& thread,
       limitEnforcer(kj::mv(limitEnforcerParam)),
       threadId(getThreadId()),
       deleteQueue(kj::atomicRefcounted<DeleteQueue>()),
+      MAX_TOTAL_PUT_SIZE(limitEnforcer->getCachePUTLimitMB() * MB),
+      cachePutQuota(MAX_TOTAL_PUT_SIZE),
       waitUntilTasks(*this),
       timeoutManager(kj::heap<TimeoutManagerImpl>()) {
   kj::PromiseFulfillerPair<void> paf = kj::newPromiseAndFulfiller<void>();
@@ -1234,6 +1236,7 @@ jsg::Promise<kj::Maybe<IoOwn<kj::AsyncInputStream>>> IoContext::makeCachePutStre
     // This Cache API subrequest would exceed the total PUT quota. There used to be a limit on
     // individual puts, but now this is only used as a fast path for rejecting PUTs going byond the
     // total quota early.
+    // TODO: Replace this with a check for initial quota.
     if (length > MAX_TOTAL_PUT_SIZE) {
       return js.resolvedPromise(kj::Maybe<IoOwn<kj::AsyncInputStream>>(kj::none));
     }
@@ -1244,7 +1247,7 @@ jsg::Promise<kj::Maybe<IoOwn<kj::AsyncInputStream>>> IoContext::makeCachePutStre
   KJ_DEFER(cachePutQuota = kj::mv(paf.promise));
 
   return awaitIo(js, cachePutQuota.then(
-      [fulfiller = kj::mv(paf.fulfiller), stream = kj::mv(stream)](size_t quota) mutable
+      [fulfiller = kj::mv(paf.fulfiller), stream = kj::mv(stream), MAX_TOTAL_PUT_SIZE = MAX_TOTAL_PUT_SIZE](size_t quota) mutable
           -> kj::Maybe<kj::Own<kj::AsyncInputStream>> {
     if (quota == 0) {
       fulfiller->fulfill(kj::cp(quota));

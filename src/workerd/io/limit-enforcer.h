@@ -142,6 +142,9 @@ public:
 
   // Report resource usage metrics to the given request metrics object.
   virtual void reportMetrics(RequestObserver& requestMetrics) = 0;
+
+  // Quota for total PUTs to cache in MB.
+  virtual uint64_t getCachePUTLimitMB() = 0;
 };
 
 }  // namespace workerd

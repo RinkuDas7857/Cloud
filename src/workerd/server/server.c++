@@ -2097,6 +2097,9 @@ private:
   kj::Promise<void> onLimitsExceeded() override { return kj::NEVER_DONE; }
   void requireLimitsNotExceeded() override {}
   void reportMetrics(RequestObserver& requestMetrics) override {}
+
+  // Unlike the other metrics, a 5GB limit is used here by default.
+  uint64_t getCachePUTLimitMB() override { return 5 * ((uint64_t)(1 << 10)); }
 };
 
 struct FutureSubrequestChannel {

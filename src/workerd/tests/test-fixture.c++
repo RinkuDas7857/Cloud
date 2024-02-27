@@ -135,6 +135,7 @@ struct MockLimitEnforcer final: public LimitEnforcer {
   kj::Maybe<EventOutcome> getLimitsExceeded() override { return kj::none; }
   kj::Promise<void> onLimitsExceeded() override { return kj::NEVER_DONE; }
   void requireLimitsNotExceeded() override {}
+  uint64_t getCachePUTLimitMB() override { return 5 * ((uint64_t)(1 << 10)); }
   void reportMetrics(RequestObserver& requestMetrics) override {}
 
 };
